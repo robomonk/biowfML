@@ -7,7 +7,6 @@ from utils import parse_gcs_uri, InvalidGCSPathError # Added
 
 logger = logging.getLogger(__name__)
 
-@ray.remote
 class MetricsLogger:
     def __init__(self, gcs_log_dir: str):
         """
@@ -21,16 +20,26 @@ class MetricsLogger:
             logger.error(f"gcs_log_dir must be a GCS path starting with 'gs://'. Got: {gcs_log_dir}")
             raise ValueError("gcs_log_dir must be a GCS path starting with 'gs://'")
 
-        self.gcs_log_dir = gcs_log_dir.rstrip('/') + '/' # Ensure trailing slash for consistency
+        # self.gcs_log_dir = gcs_log_dir.rstrip('/') + '/' # Ensure trailing slash for consistency
 
         try:
-            self.bucket_name, self.blob_prefix = parse_gcs_uri(self.gcs_log_dir)
-            # parse_gcs_uri might return an empty blob_prefix if the path is just "gs://bucket/",
-            # ensure blob_prefix ends with a slash if it's not empty, for os.path.join compatibility.
-            if self.blob_prefix and not self.blob_prefix.endswith('/'):
-                self.blob_prefix += '/'
+            # Parse the original gcs_log_dir first
+            raw_bucket_name, raw_blob_prefix = parse_gcs_uri(gcs_log_dir)
+
+            self.bucket_name = raw_bucket_name
+            # Ensure blob_prefix has a trailing slash if it's not empty for consistency
+            if raw_blob_prefix:
+                self.blob_prefix = raw_blob_prefix.rstrip('/') + '/'
+            else:
+                self.blob_prefix = "" # Handles cases like "gs://bucket-name" or "gs://bucket-name/"
+
+            # Reconstruct gcs_log_dir for internal use, ensuring it ends with a slash
+            self.gcs_log_dir = f"gs://{self.bucket_name}/{self.blob_prefix}"
+            if not self.gcs_log_dir.endswith('/'): # Should already be handled but as a safeguard
+                 self.gcs_log_dir += '/'
+
         except InvalidGCSPathError as e:
-            logger.error(f"Invalid GCS log directory URI in MetricsLogger: {self.gcs_log_dir} - {e}")
+            logger.error(f"Invalid GCS log directory URI in MetricsLogger: {gcs_log_dir} - {e}")
             raise # Re-raise to prevent actor from starting with bad config
 
         self.storage_client = storage.Client()
