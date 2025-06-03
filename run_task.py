@@ -350,7 +350,7 @@ def run_computational_task(
                 path_without_base = mounted_path[len(gcs_fuse_mount_base):].lstrip('/')
                 bucket_name_from_path = path_without_base.split('/')[0]
                 blob_name_from_path = '/'.join(path_without_base.split('/')[1:])
-            gcs_output_files[key] = f"gs://{bucket_name_from_path}/{blob_name_from_path}"
+                gcs_output_files[key] = f"gs://{bucket_name_from_path}/{blob_name_from_path}"
         else:
             gcs_output_files[key] = mounted_path # If it was already a GCS path or not mounted correctly
 
