@@ -29,11 +29,7 @@ echo "Created mount base directory: ${MOUNT_BASE}"
 
 # --- Define your GCS buckets to mount ---
 GCS_BUCKETS_TO_MOUNT=(
-    "rsabawi-hpc-sandbox-926388-genomics-reads"
-    "rsabawi-hpc-sandbox-926388-genomics-refs"
-    "rsabawi-hpc-sandbox-926388-staging-area"
-    "rsabawi-hpc-sandbox-926388-genomics-results"
-    "rsabawi-hpc-sandbox-926388-tensorboard-logs"
+GCS_BUCKETS_TO_MOUNT_PLACEHOLDER
 )
 
 # Mount each bucket

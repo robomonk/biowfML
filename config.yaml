@@ -28,8 +28,10 @@ input_sources:
 
 # --- Tool Images (Docker Hub or Google Container Registry paths) ---
 tool_images:
-  bwa_mem: "biocontainers/bwa:0.7.17--he4a0461_8" # REPLACE with your BWA image
-  samtools_sort: "biocontainers/samtools:1.16.1--h3840ad3_1" # REPLACE with your Samtools image
+  bwa: "biocontainers/bwa:0.7.17--he4a0461_8"  # Was bwa_mem, now 'bwa'
+  samtools: "biocontainers/samtools:1.16.1--h3840ad3_1" # Was samtools_sort, now 'samtools'
+  picard: "broadinstitute/picard:latest" # Placeholder, replace with actual image
+  gatk: "broadinstitute/gatk:latest"     # Placeholder, replace with actual image
 
 # --- Workflow Definition (Sequence of abstract tasks) ---
 workflow_definition:
@@ -57,7 +59,12 @@ output_prefixes:
   aligned_bams: "aligned_bams/"
   multiqc_reports: "multiqc_reports/"
 
-# --- RL Specific Configuration (initial placeholders) --- service-263885197854@gcp-sa-aiplatform-cc.iam.gserviceaccount.com
+# --- GCP Cost Configuration ---
+gcp_costs:
+  cpu_per_hour: 0.031611
+  ram_per_gb_hour: 0.004237
+
+# --- RL Specific Configuration (initial placeholders) ---
 rl_config:
   action_tiers:
     0: {cpu: 1, ram_gb: 4}
@@ -74,4 +81,17 @@ rl_config:
     max_duration_seconds: 3600
     max_cost: 0.5
     max_input_size_gb: 100
-    max_cluster_load_percent: 100
+    max_cluster_load_percent: 1.0 # Assuming 0-1 scale for load
+    max_attempts: 5 # Added
+  historical_performance_window: 10 # Added as per previous step
+
+# --- GCS FUSE Mount Configuration ---
+gcs_fuse_mounts:
+  # List all bucket names that need to be FUSE mounted by gcsfuse_startup.sh
+  # These are just bucket names, not full gs:// paths.
+  buckets_to_mount:
+    - "rsabawi-hpc-sandbox-926388-genomics-reads"  # Example from original script
+    - "rsabawi-hpc-sandbox-926388-genomics-refs"    # Example from original script
+    # The python script create_ray_cluster_script.py will dynamically add bucket names
+    # derived from gcs_paths (like output_results_bucket, tensorboard_log_bucket, staging_bucket)
+    # to this list if they are not already present.
