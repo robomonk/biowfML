@@ -45,6 +45,7 @@ workflow_definition:
     # Output will go to a *dynamic subdirectory* within output_results_bucket
     output_prefix: "${gcs_paths.output_results_bucket}/${output_prefixes.aligned_bams}"
     produces_primary_output: True
+    primary_output_key: "aligned_sam" # Added
 
   - task_id_prefix: "samtools-sort"
     type: "samtools_sort"
@@ -52,6 +53,7 @@ workflow_definition:
       input_bam: "dynamic_from_previous_task" # This will be the path from the BWA output
     output_prefix: "${gcs_paths.output_results_bucket}/${output_prefixes.aligned_bams}"
     produces_primary_output: True
+    primary_output_key: "sorted_bam" # Added
 
 # --- Output Prefixes (relative paths within output_results_bucket) ---
 # These are prefixes for final results, not the staging area.

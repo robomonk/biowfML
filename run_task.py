@@ -2,16 +2,14 @@ import ray
 import subprocess
 import time
 import os
-import psutil
-import json
-import yaml
+# Removed psutil, json, yaml
 import re
+import logging
+from utils import parse_gcs_uri, InvalidGCSPathError # Added
 
-# --- Configuration Loading Function (kept for completeness, but config is passed in) ---
-def load_config(config_path: str):
-    with open(config_path, 'r') as f:
-        config = yaml.safe_load(f)
-    return config
+logger = logging.getLogger(__name__)
+
+# load_config function removed
 
 # --- GCP Cost Modeling ---
 def calculate_gcp_cost(duration_seconds, cpu_allocated, ram_allocated_gb, cost_config: dict):
@@ -68,7 +66,7 @@ def run_computational_task(
 
     local_work_dir = f"/tmp/ray_task_{task_id}" # Temporary local directory on the worker VM
     os.makedirs(local_work_dir, exist_ok=True) # Create if it doesn't exist
-    print(f"[{task_id}] Task {task_type} started in {local_work_dir}")
+    logger.info(f"Task {task_type} (ID: {task_id}) started in {local_work_dir}")
 
     # --- Get Configured Paths & Tool Images ---
     gcs_fuse_mount_base = pipeline_config['gcs_paths']['gcs_fuse_mount_base']
@@ -82,8 +80,12 @@ def run_computational_task(
     # Assumes GCS buckets are mounted under MOUNT_BASE/<bucket_name>/
     def get_mounted_path(gcs_path):
         if gcs_path.startswith("gs://"):
-            bucket_name = gcs_path.split('//')[1].split('/')[0]
-            blob_path = '/'.join(gcs_path.split('/')[3:])
+            try:
+                bucket_name, blob_path = parse_gcs_uri(gcs_path)
+            except InvalidGCSPathError: # Should not happen if gcs_path.startswith("gs://") is true
+                # This case implies an internal logic error if reached, as starts_with was checked
+                logger.error(f"Internal error: get_mounted_path called with invalid GCS URI after check: {gcs_path}")
+                return gcs_path # Fallback to old behavior, though problematic
             return os.path.join(gcs_fuse_mount_base, bucket_name, blob_path)
         return gcs_path # Return as is if not a GCS path (e.g., dynamic_from_previous_task)
 
@@ -103,8 +105,8 @@ def run_computational_task(
     mounted_output_dir = get_mounted_path(output_gcs_dir)
     os.makedirs(mounted_output_dir, exist_ok=True) # Ensure output directory exists
 
-    print(f"[{task_id}] Mounted Inputs: {mounted_inputs}")
-    print(f"[{task_id}] Mounted Output Dir: {mounted_output_dir}")
+    logger.info(f"Task {task_id} Mounted Inputs: {mounted_inputs}")
+    logger.info(f"Task {task_id} Mounted Output Dir: {mounted_output_dir}")
 
     try:
         # --- Tool-specific Commands ---
@@ -160,7 +162,7 @@ def run_computational_task(
             # Execute BWA, capture its stdout
             # The docker_cmd_with_image here is specific for BWA, including the image and then the bwa command
             final_bwa_docker_command = bwa_docker_cmd_prefix + [tool_image] + cmd_for_bwa
-            print(f"[{task_id}] Running BWA mem with command: {' '.join(final_bwa_docker_command)}")
+            logger.info(f"Task {task_id} Running BWA mem with command: {' '.join(final_bwa_docker_command)}")
             bwa_process = subprocess.run(
                 final_bwa_docker_command,
                 check=True, # Will raise CalledProcessError on non-zero exit
@@ -243,13 +245,13 @@ def run_computational_task(
         # --- Execute the Docker Command (for non-BWA tasks) ---
         if task_type != "bwa_mem_align": # BWA already ran
             final_docker_command = docker_cmd_with_image + tool_args
-            print(f"[{task_id}] Executing: {' '.join(final_docker_command)}")
+            logger.info(f"Task {task_id} Executing: {' '.join(final_docker_command)}")
             process = subprocess.run(final_docker_command, check=True, capture_output=True, text=True)
 
             if process.stdout:
-                print(f"[{task_id}] STDOUT:\n{process.stdout[:2000]}...")
+                logger.debug(f"Task {task_id} STDOUT:\n{process.stdout[:2000]}...") # DEBUG level for potentially verbose output
             if process.stderr:
-                print(f"[{task_id}] STDERR:\n{process.stderr[:2000]}...")
+                logger.debug(f"Task {task_id} STDERR:\n{process.stderr[:2000]}...") # DEBUG level
             # exit_status will be set after stats collection attempt based on process.returncode
 
         # --- Collect Docker Stats ---
@@ -276,11 +278,11 @@ def run_computational_task(
 
         try:
             stats_cmd = ["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}} / {{.MemUsage}}", container_name]
-            print(f"[{task_id}] Getting stats with: {' '.join(stats_cmd)}")
+            logger.info(f"Task {task_id} Getting stats with: {' '.join(stats_cmd)}")
             stats_process = subprocess.run(stats_cmd, capture_output=True, text=True, check=False)
 
             if stats_process.returncode == 0 and stats_process.stdout.strip():
-                print(f"[{task_id}] Docker stats output: {stats_process.stdout.strip()}")
+                logger.info(f"Task {task_id} Docker stats output: {stats_process.stdout.strip()}")
                 parts = stats_process.stdout.strip().split('/')
                 cpu_perc_str = parts[0].strip().replace('%', '')
                 # MemUsage part can be "700.1MiB / 1.952GiB", so we take the first part before " / "
@@ -292,48 +294,48 @@ def run_computational_task(
                     avg_cpu_util_ratio = (cpu_perc_val / 100.0) / cpu_allocation
                     avg_cpu_util_ratio = max(0.0, min(avg_cpu_util_ratio, 1.0))
                 except ValueError:
-                    print(f"[{task_id}] Warning: Could not parse CPU percentage from stats: {cpu_perc_str}")
+                    logger.warning(f"Task {task_id} Warning: Could not parse CPU percentage from stats: {cpu_perc_str}")
                     avg_cpu_util_ratio = 0.0
 
                 actual_ram_util_gb = parse_memory_to_gb(mem_usage_str)
-                print(f"[{task_id}] Parsed Stats - CPU Util Ratio (rel. to alloc): {avg_cpu_util_ratio:.2f}, RAM Usage: {actual_ram_util_gb:.2f} GB")
+                logger.info(f"Task {task_id} Parsed Stats - CPU Util Ratio (rel. to alloc): {avg_cpu_util_ratio:.2f}, RAM Usage: {actual_ram_util_gb:.2f} GB")
 
             else:
-                print(f"[{task_id}] Warning: Could not retrieve Docker stats. stdout: {stats_process.stdout}, stderr: {stats_process.stderr}")
+                logger.warning(f"Task {task_id} Warning: Could not retrieve Docker stats. stdout: {stats_process.stdout}, stderr: {stats_process.stderr}")
                 # Defaults avg_cpu_util_ratio = 0.0, actual_ram_util_gb = 0.0 already set
 
         except Exception as e_stats:
-            print(f"[{task_id}] Error collecting Docker stats: {e_stats}")
+            logger.exception(f"Task {task_id} Error collecting Docker stats:")
             # Defaults avg_cpu_util_ratio = 0.0, actual_ram_util_gb = 0.0 already set
 
     except subprocess.CalledProcessError as e:
-        print(f"[{task_id}] Task {task_type} failed with exit code {e.returncode}")
-        if hasattr(e, 'stdout') and e.stdout: print(f"STDOUT: {e.stdout}")
-        if hasattr(e, 'stderr') and e.stderr: print(f"STDERR: {e.stderr}")
+        logger.error(f"Task {task_type} (ID: {task_id}) failed with exit code {e.returncode}")
+        if hasattr(e, 'stdout') and e.stdout: logger.error(f"Task {task_id} STDOUT: {e.stdout}")
+        if hasattr(e, 'stderr') and e.stderr: logger.error(f"Task {task_id} STDERR: {e.stderr}")
         exit_status = e.returncode
     except Exception as e:
-        print(f"[{task_id}] An unexpected error occurred during {task_type}: {e}")
+        logger.exception(f"Task {task_id} An unexpected error occurred during {task_type}:")
         exit_status = 1 # General failure
 
     finally:
         # Attempt to remove the container
-        print(f"[{task_id}] Attempting to remove container {container_name}...")
+        logger.info(f"Task {task_id} Attempting to remove container {container_name}...")
         try:
             # Use capture_output and text=True to avoid printing to console unless debugging
             rm_stats = subprocess.run(["docker", "rm", container_name], check=False, capture_output=True, text=True)
             if rm_stats.returncode == 0:
-                print(f"[{task_id}] Container {container_name} removed successfully.")
+                logger.info(f"Task {task_id} Container {container_name} removed successfully.")
             else:
                 # It's common for rm to fail if the container never started, so only log if verbose/debug needed
-                print(f"[{task_id}] Info: Could not remove container {container_name} (it might have already been removed or failed to start). stderr: {rm_stats.stderr.strip()}")
+                logger.info(f"Task {task_id} Info: Could not remove container {container_name} (it might have already been removed or failed to start). stderr: {rm_stats.stderr.strip()}")
         except Exception as e_rm:
-            print(f"[{task_id}] Warning: Exception during attempt to remove container {container_name}: {e_rm}")
+            logger.warning(f"Task {task_id} Warning: Exception during attempt to remove container {container_name}: {e_rm}")
 
         end_time = time.time()
         duration_seconds = end_time - start_time
         task_cost = calculate_gcp_cost(duration_seconds, cpu_allocation, ram_allocation_gb, pipeline_config['gcp_costs'])
 
-        print(f"[{task_id}] Task {task_type} finished. Duration: {duration_seconds:.2f}s, Cost: ${task_cost:.4f}, Status: {'Success' if exit_status == 0 else 'Failure'}")
+        logger.info(f"Task {task_type} (ID: {task_id}) finished. Duration: {duration_seconds:.2f}s, Cost: ${task_cost:.4f}, Status: {'Success' if exit_status == 0 else 'Failure'}")
         # Clean up local work directory if it was used for temp files.
         # For gcsfuse, temp files might not be heavily used, but it's good practice.
         # import shutil
