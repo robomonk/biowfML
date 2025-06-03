@@ -1,4 +1,4 @@
-import gym
+import gymnasium as gym # Changed from import gym
 import numpy as np
 import ray
 import uuid
@@ -149,7 +149,7 @@ class WorkflowEnv(gym.Env):
                 self.staged_gcs_input_paths[input_key] = None # Mark as failed
                 raise # Re-raise to stop episode if staging fails critically
 
-    def reset(self):
+    def reset(self, *, seed=None, options=None): # Added seed and options
         """
         Resets the environment for a new episode.
         Stages data and prepares the first task.
