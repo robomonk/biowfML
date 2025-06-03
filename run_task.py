@@ -3,9 +3,9 @@ import subprocess
 import time
 import os
 import psutil
-from google.cloud import storage
 import json
 import yaml
+import re
 
 # --- Configuration Loading Function (kept for completeness, but config is passed in) ---
 def load_config(config_path: str):
@@ -13,32 +13,37 @@ def load_config(config_path: str):
         config = yaml.safe_load(f)
     return config
 
-# --- GCS Utility Functions (for direct download if gcsfuse isn't used) ---
-# These functions are here if you opt not to use gcsfuse.
-def download_blob_to_file(bucket_name, source_blob_name, destination_file_name):
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-    blob = bucket.blob(source_blob_name)
-    blob.download_to_filename(destination_file_name)
-    print(f"Downloaded {source_blob_name} to {destination_file_name}")
-
-def upload_file_to_gcs(bucket_name, source_file_name, destination_blob_name):
-    storage_client = storage_client.bucket(bucket_name)
-    blob = storage_client.blob(destination_blob_name)
-    blob.upload_from_filename(source_file_name)
-    print(f"Uploaded {source_file_name} to {destination_blob_name}")
-    return f"gs://{bucket_name}/{destination_blob_name}"
-
 # --- GCP Cost Modeling ---
-# These are illustrative values, adjust based on actual GCP pricing for your region
-CPU_COST_PER_HOUR = 0.031611
-RAM_COST_PER_HOUR = 0.004237
-
-def calculate_gcp_cost(duration_seconds, cpu_allocated, ram_allocated_gb):
-    cpu_cost_per_sec = (CPU_COST_PER_HOUR / 3600) * cpu_allocated
-    ram_cost_per_sec = (RAM_COST_PER_HOUR / 3600) * ram_allocated_gb
+def calculate_gcp_cost(duration_seconds, cpu_allocated, ram_allocated_gb, cost_config: dict):
+    cpu_cost_per_hour = cost_config['cpu_per_hour']
+    ram_cost_per_hour = cost_config['ram_per_gb_hour']
+    cpu_cost_per_sec = (cpu_cost_per_hour / 3600) * cpu_allocated
+    ram_cost_per_sec = (ram_cost_per_hour / 3600) * ram_allocated_gb
     total_cost = duration_seconds * (cpu_cost_per_sec + ram_cost_per_sec)
     return total_cost
+
+def parse_memory_to_gb(mem_str):
+    # Parses memory strings like "700.1MiB", "1.5GiB", "100KiB" into GB
+    # Returns 0.0 on parsing error or if input is not a string
+    if not isinstance(mem_str, str):
+        return 0.0
+    match = re.match(r'(\d+\.?\d*)\s*([KMGT]?i?B)', mem_str, re.IGNORECASE)
+    if not match:
+        return 0.0
+
+    val = float(match.group(1))
+    unit = match.group(2).upper()
+
+    if unit.startswith('K'):
+        return val / (1024**2) # KiB to GB
+    elif unit.startswith('M'):
+        return val / 1024      # MiB to GB
+    elif unit.startswith('G'):
+        return val             # GiB to GB
+    elif unit.startswith('T'):
+        return val * 1024      # TiB to GB
+    else: # Bytes
+        return val / (1024**3) # B to GB
 
 # --- Ray Remote Function for Task Execution ---
 @ray.remote
@@ -58,6 +63,8 @@ def run_computational_task(
     start_time = time.time()
     exit_status = 1 # Assume failure by default
     output_files = {} # To store GCS paths of generated output files
+    avg_cpu_util_ratio = 0.0 # Initialize resource metrics
+    actual_ram_util_gb = 0.0 # Initialize resource metrics
 
     local_work_dir = f"/tmp/ray_task_{task_id}" # Temporary local directory on the worker VM
     os.makedirs(local_work_dir, exist_ok=True) # Create if it doesn't exist
@@ -84,9 +91,11 @@ def run_computational_task(
     # Mount the entire /mnt/gcs to /mnt/gcs inside the container
     # This assumes tools can then directly use paths like /mnt/gcs/<bucket>/<file>
     # And that the tool images are configured to see this mount.
-    docker_cmd_prefix = ["docker", "run", "--rm", "-v", f"{gcs_fuse_mount_base}:{gcs_fuse_mount_base}"]
+    container_name = f"container-{task_id}"
+    docker_cmd_prefix = ["docker", "run", f"--name={container_name}", "-v", f"{gcs_fuse_mount_base}:{gcs_fuse_mount_base}"]
     docker_cmd_prefix += [f"--cpus={cpu_allocation}", f"--memory={ram_allocation_gb}g"]
     # Add the tool image as the first argument after prefix
+    # Note: For bwa_mem_align, docker_cmd_with_image is redefined locally later. This is OK.
     docker_cmd_with_image = docker_cmd_prefix + [tool_image]
 
     # Convert GCS input/output paths to their mounted counterparts
@@ -137,6 +146,10 @@ def run_computational_task(
             # The user's example showed `> 7859_GPI.aln_pe.sam` which means shell redirection.
             # So we run the command and capture stdout.
 
+            # Define the docker command for BWA specifically, including the container name
+            # This reuses docker_cmd_prefix which now includes the container name
+            bwa_docker_cmd_prefix = docker_cmd_prefix # docker_cmd_prefix already has --name
+
             cmd_for_bwa = [
                 "mem", "-R", "@RG\\tID:t1\\tSM:t1", # Use raw string for @RG to avoid python interpretation
                 ref_file, read1
@@ -145,10 +158,12 @@ def run_computational_task(
                 cmd_for_bwa.append(read2)
 
             # Execute BWA, capture its stdout
-            print(f"[{task_id}] Running BWA mem with command: {' '.join(docker_cmd_with_image + cmd_for_bwa)}")
+            # The docker_cmd_with_image here is specific for BWA, including the image and then the bwa command
+            final_bwa_docker_command = bwa_docker_cmd_prefix + [tool_image] + cmd_for_bwa
+            print(f"[{task_id}] Running BWA mem with command: {' '.join(final_bwa_docker_command)}")
             bwa_process = subprocess.run(
-                docker_cmd_with_image + cmd_for_bwa,
-                check=True,
+                final_bwa_docker_command,
+                check=True, # Will raise CalledProcessError on non-zero exit
                 capture_output=True,
                 text=True # Decode stdout/stderr as text
             )
@@ -158,7 +173,8 @@ def run_computational_task(
                 f.write(bwa_process.stdout)
 
             output_files['aligned_sam'] = output_sam_file # GCS path will be handled at return
-            exit_status = 0 # Assume success if subprocess.run passed check=True
+            # exit_status will be set after stats collection attempt based on bwa_process.returncode
+            # For now, if we are here, bwa_process was successful due to check=True
 
 
         elif task_type == "picard_sort_sam":
@@ -224,34 +240,98 @@ def run_computational_task(
             raise ValueError(f"Unknown task type: {task_type}")
 
         # --- Execute the Docker Command ---
-        # Construct the full docker command to run the tool.
-        # This is `docker run <prefix> <image> <tool_args>`
-        final_docker_command = docker_cmd_with_image + tool_args
+        # --- Execute the Docker Command (for non-BWA tasks) ---
+        if task_type != "bwa_mem_align": # BWA already ran
+            final_docker_command = docker_cmd_with_image + tool_args
+            print(f"[{task_id}] Executing: {' '.join(final_docker_command)}")
+            process = subprocess.run(final_docker_command, check=True, capture_output=True, text=True)
 
-        print(f"[{task_id}] Executing: {' '.join(final_docker_command)}")
-        process = subprocess.run(final_docker_command, check=True, capture_output=True, text=True) # Capture stdout/stderr
+            if process.stdout:
+                print(f"[{task_id}] STDOUT:\n{process.stdout[:2000]}...")
+            if process.stderr:
+                print(f"[{task_id}] STDERR:\n{process.stderr[:2000]}...")
+            # exit_status will be set after stats collection attempt based on process.returncode
 
-        # Log stdout/stderr if useful for debugging (limit output for brevity)
-        if process.stdout:
-            print(f"[{task_id}] STDOUT:\n{process.stdout[:2000]}...")
-        if process.stderr:
-            print(f"[{task_id}] STDERR:\n{process.stderr[:2000]}...")
+        # --- Collect Docker Stats ---
+        # This block runs if the main docker command was successful (or even if not, stats might be available)
+        # For bwa_mem_align, bwa_process holds the result. For others, process holds it.
+        # We assume if check=True didn't fail, the process object exists and returncode is 0.
+        # If an exception occurred before process/bwa_process was set (e.g. config error), this won't run.
 
-        exit_status = 0 # Set to 0 if subprocess.run didn't raise CalledProcessError
+        # Determine task success before stats collection attempt
+        if task_type == "bwa_mem_align":
+            if 'bwa_process' in locals() and bwa_process.returncode == 0:
+                exit_status = 0
+            elif 'bwa_process' in locals():
+                exit_status = bwa_process.returncode
+            else: # bwa_process not even defined, means major issue before execution
+                exit_status = 1 # Default to failure
+        else: # For other tasks
+            if 'process' in locals() and process.returncode == 0:
+                exit_status = 0
+            elif 'process' in locals():
+                exit_status = process.returncode
+            else: # process not even defined
+                exit_status = 1 # Default to failure
+
+        try:
+            stats_cmd = ["docker", "stats", "--no-stream", "--format", "{{.CPUPerc}} / {{.MemUsage}}", container_name]
+            print(f"[{task_id}] Getting stats with: {' '.join(stats_cmd)}")
+            stats_process = subprocess.run(stats_cmd, capture_output=True, text=True, check=False)
+
+            if stats_process.returncode == 0 and stats_process.stdout.strip():
+                print(f"[{task_id}] Docker stats output: {stats_process.stdout.strip()}")
+                parts = stats_process.stdout.strip().split('/')
+                cpu_perc_str = parts[0].strip().replace('%', '')
+                # MemUsage part can be "700.1MiB / 1.952GiB", so we take the first part before " / "
+                mem_usage_str = parts[1].strip().split(' ')[0]
+
+
+                try:
+                    cpu_perc_val = float(cpu_perc_str)
+                    avg_cpu_util_ratio = (cpu_perc_val / 100.0) / cpu_allocation
+                    avg_cpu_util_ratio = max(0.0, min(avg_cpu_util_ratio, 1.0))
+                except ValueError:
+                    print(f"[{task_id}] Warning: Could not parse CPU percentage from stats: {cpu_perc_str}")
+                    avg_cpu_util_ratio = 0.0
+
+                actual_ram_util_gb = parse_memory_to_gb(mem_usage_str)
+                print(f"[{task_id}] Parsed Stats - CPU Util Ratio (rel. to alloc): {avg_cpu_util_ratio:.2f}, RAM Usage: {actual_ram_util_gb:.2f} GB")
+
+            else:
+                print(f"[{task_id}] Warning: Could not retrieve Docker stats. stdout: {stats_process.stdout}, stderr: {stats_process.stderr}")
+                # Defaults avg_cpu_util_ratio = 0.0, actual_ram_util_gb = 0.0 already set
+
+        except Exception as e_stats:
+            print(f"[{task_id}] Error collecting Docker stats: {e_stats}")
+            # Defaults avg_cpu_util_ratio = 0.0, actual_ram_util_gb = 0.0 already set
 
     except subprocess.CalledProcessError as e:
         print(f"[{task_id}] Task {task_type} failed with exit code {e.returncode}")
-        print(f"STDOUT: {e.stdout}")
-        print(f"STDERR: {e.stderr}")
+        if hasattr(e, 'stdout') and e.stdout: print(f"STDOUT: {e.stdout}")
+        if hasattr(e, 'stderr') and e.stderr: print(f"STDERR: {e.stderr}")
         exit_status = e.returncode
     except Exception as e:
         print(f"[{task_id}] An unexpected error occurred during {task_type}: {e}")
-        exit_status = 1
+        exit_status = 1 # General failure
 
     finally:
+        # Attempt to remove the container
+        print(f"[{task_id}] Attempting to remove container {container_name}...")
+        try:
+            # Use capture_output and text=True to avoid printing to console unless debugging
+            rm_stats = subprocess.run(["docker", "rm", container_name], check=False, capture_output=True, text=True)
+            if rm_stats.returncode == 0:
+                print(f"[{task_id}] Container {container_name} removed successfully.")
+            else:
+                # It's common for rm to fail if the container never started, so only log if verbose/debug needed
+                print(f"[{task_id}] Info: Could not remove container {container_name} (it might have already been removed or failed to start). stderr: {rm_stats.stderr.strip()}")
+        except Exception as e_rm:
+            print(f"[{task_id}] Warning: Exception during attempt to remove container {container_name}: {e_rm}")
+
         end_time = time.time()
         duration_seconds = end_time - start_time
-        task_cost = calculate_gcp_cost(duration_seconds, cpu_allocation, ram_allocation_gb)
+        task_cost = calculate_gcp_cost(duration_seconds, cpu_allocation, ram_allocation_gb, pipeline_config['gcp_costs'])
 
         print(f"[{task_id}] Task {task_type} finished. Duration: {duration_seconds:.2f}s, Cost: ${task_cost:.4f}, Status: {'Success' if exit_status == 0 else 'Failure'}")
         # Clean up local work directory if it was used for temp files.
@@ -263,32 +343,23 @@ def run_computational_task(
     gcs_output_files = {}
     for key, mounted_path in output_files.items():
         if mounted_path.startswith(gcs_fuse_mount_base):
-            relative_path = mounted_path[len(gcs_fuse_mount_base):]
-            bucket_name_from_path = relative_path.split('/')[0]
-            blob_name_from_path = '/'.join(relative_path.split('/')[1:])
+                # Correctly reconstruct GCS path from mounted path
+                # Example: /mnt/gcs_fuse/my-bucket/path/to/file.txt -> gs://my-bucket/path/to/file.txt
+                path_without_base = mounted_path[len(gcs_fuse_mount_base):].lstrip('/')
+                bucket_name_from_path = path_without_base.split('/')[0]
+                blob_name_from_path = '/'.join(path_without_base.split('/')[1:])
             gcs_output_files[key] = f"gs://{bucket_name_from_path}/{blob_name_from_path}"
         else:
             gcs_output_files[key] = mounted_path # If it was already a GCS path or not mounted correctly
 
-    # These are dummy values for now. Update this based on actual resource monitoring
-    # (e.g., using docker stats for the specific container).
-    avg_cpu_util_ratio = 0.5
-    avg_ram_util_ratio = 0.5
-    try:
-        process_info = psutil.Process(os.getpid())
-        avg_cpu_util_ratio = process_info.cpu_percent(interval=0.1) / 100.0 / psutil.cpu_count() # Normalize to 0-1 based on physical cores
-        ram_utilization_gb = process_info.memory_info().rss / (1024**3)
-        avg_ram_util_ratio = ram_utilization_gb / ram_allocation_gb if ram_allocation_gb > 0 else 0.0
-    except Exception as e:
-        print(f"Warning: Could not get precise psutil metrics: {e}")
 
     return {
         'task_id': task_id,
         'task_type': task_type,
         'duration_seconds': duration_seconds,
         'cost': task_cost,
-        'cpu_utilization': avg_cpu_util_ratio, # Normalized 0-1
-        'ram_utilization_gb': avg_ram_util_ratio * ram_allocation_gb, # Actual GB used (approx)
+        'cpu_utilization': avg_cpu_util_ratio, # Updated: Normalized 0-1 from docker stats
+        'ram_utilization_gb': actual_ram_util_gb, # Updated: Actual GB used from docker stats
         'cpu_allocated': cpu_allocation,
         'ram_allocated_gb': ram_allocation_gb,
         'exit_status': exit_status,

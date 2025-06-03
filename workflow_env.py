@@ -6,6 +6,7 @@ import os
 import time
 from google.cloud import storage
 import subprocess
+import statistics # Added for calculating mean
 from run_task import run_computational_task # Corrected import to the right function
 from metrics_logger import MetricsLogger # Import MetricsLogger for use
 
@@ -55,9 +56,36 @@ class WorkflowEnv(gym.Env):
         self.staged_gcs_input_paths = {} # GCS paths of inputs after staging (e.g., from public -> staging_bucket)
         self.last_task_output_path = None # Output of previous task, passed as dynamic input to next
         self.metrics_logger_actor = None # MetricsLogger Ray Actor
+        self.gcs_client = None # Initialize GCS client, will be instantiated on first use
 
-        # For historical performance (simplified for now)
-        self.historical_performance = {} # {task_type: {'durations':[], 'costs':[], ...}}
+        # For historical performance
+        self.historical_performance = {} # {task_type: {'durations':[], 'costs':[], 'cpu_utils':[], 'ram_utils':[]}}
+
+    def _resolve_input_gcs_paths_for_observation(self, current_task_def: dict) -> list[str]:
+        if not current_task_def:
+            return []
+
+        task_input_gcs_uris = []
+        for input_key, input_val_template in current_task_def.get('inputs', {}).items():
+            resolved_path = None
+            if isinstance(input_val_template, str):
+                if input_val_template.startswith("${input_sources."):
+                    source_key = input_val_template.split('.')[1].rstrip('}')
+                    resolved_path = self.staged_gcs_input_paths.get(source_key)
+                elif input_val_template == "dynamic_from_previous_task":
+                    resolved_path = self.last_task_output_path # This comes from the main step logic
+                elif input_val_template == "dynamic_from_previous_task_intervals":
+                     resolved_path = self.last_task_output_path # Assuming this is how it's handled
+                else: # Direct GCS path
+                    if input_val_template.startswith("gs://"):
+                        resolved_path = input_val_template
+
+            if resolved_path and resolved_path.startswith("gs://"):
+                task_input_gcs_uris.append(resolved_path)
+            elif resolved_path: # Could be a local path if workflow changes, log a warning
+                print(f"[EnvObs] Warning: Resolved input path {resolved_path} is not a GCS URI for size calculation.")
+
+        return task_input_gcs_uris
 
     def _stage_data(self):
         """
@@ -232,6 +260,25 @@ class WorkflowEnv(gym.Env):
         if self.metrics_logger_actor:
             ray.get(self.metrics_logger_actor.log_task_metrics.remote(task_result)) # Log asynchronously
 
+        # --- Update Historical Performance ---
+        if task_result and task_result.get('success'): # Only log successful tasks for historical averages
+            task_type_hist_key = task_result['task_type'] # Use the actual task_type string as key
+            if task_type_hist_key not in self.historical_performance:
+                self.historical_performance[task_type_hist_key] = {'durations': [], 'costs': [], 'cpu_utils': [], 'ram_utils': []}
+
+            self.historical_performance[task_type_hist_key]['durations'].append(task_result['duration_seconds'])
+            self.historical_performance[task_type_hist_key]['costs'].append(task_result['cost'])
+            self.historical_performance[task_type_hist_key]['cpu_utils'].append(task_result['cpu_utilization']) # This should be 0-1 ratio
+
+            allocated_ram_gb = task_result.get('ram_allocated_gb', 1)
+            actual_ram_gb = task_result.get('ram_utilization_gb', 0)
+            ram_util_ratio = actual_ram_gb / allocated_ram_gb if allocated_ram_gb > 0 else 0.0
+            self.historical_performance[task_type_hist_key]['ram_utils'].append(ram_util_ratio)
+
+            history_limit = self.config.get('rl_config', {}).get('historical_performance_window', 10)
+            for key in self.historical_performance[task_type_hist_key]:
+                self.historical_performance[task_type_hist_key][key] = self.historical_performance[task_type_hist_key][key][-history_limit:]
+
         # --- Update Environment State for Next Step ---
         self.last_task_result = task_result
         self.last_task_output_path = None # Reset for the next task
@@ -327,18 +374,35 @@ class WorkflowEnv(gym.Env):
         else: # If episode is done, current_task_def is None
             obs_vec[0] = 0.0 # Or some specific value to indicate end of tasks
 
-        # Feature 1: Normalized Input Size (total size/count of input files for the *current* task)
-        # This is hard to calculate dynamically without inspecting GCS files for each task.
-        # For simplicity, let's derive it from the total staged input size.
-        # In a more advanced setup, you'd calculate actual input size for the specific task.
-        total_staged_input_size_gb = 0.0
-        # You would need to add logic here to compute file sizes of self.staged_gcs_input_paths
-        # For now, let's use a dummy value or a rough estimate.
-        # The most accurate way is to get blob.size for each input file.
-        obs_vec[1] = 0.5 # Placeholder for input size, normalized to 0-1
+        # Feature 1: Normalized Input Size
+        if self.gcs_client is None:
+            self.gcs_client = storage.Client()
+
+        current_task_input_gcs_uris = self._resolve_input_gcs_paths_for_observation(current_task_def)
+        total_input_bytes = 0
+        if current_task_def and current_task_input_gcs_uris:
+            for gcs_uri in current_task_input_gcs_uris:
+                try:
+                    bucket_name = gcs_uri.split('//')[1].split('/')[0]
+                    blob_name = '/'.join(gcs_uri.split('/')[3:])
+                    if blob_name:
+                        blob = self.gcs_client.bucket(bucket_name).get_blob(blob_name)
+                        if blob and blob.size is not None:
+                            total_input_bytes += blob.size
+                        else:
+                            print(f"[EnvObs] Warning: Could not get blob or size for {gcs_uri}")
+                    else:
+                        print(f"[EnvObs] Warning: Invalid blob name from GCS URI {gcs_uri}")
+                except Exception as e:
+                    print(f"[EnvObs] Error getting size for GCS URI {gcs_uri}: {e}")
+
+        total_input_gb = total_input_bytes / (1024**3)
+        max_input_gb = self.normalization_constants.get('max_input_size_gb', 100.0)
+        obs_vec[1] = min(total_input_gb / max_input_gb, 1.0)
 
         # Feature 2: Normalized Attempt Number
-        obs_vec[2] = min(attempt_num / self.normalization_constants.get('max_attempts', 5.0), 1.0) # Max 5 attempts for normalization
+        max_attempts_val = self.normalization_constants.get('max_attempts', 5.0) # Default if somehow missing
+        obs_vec[2] = min(attempt_num / max_attempts_val, 1.0)
 
         # Features 3-6: Normalized s_prev_task_metrics (duration, cost, cpu_util, ram_util)
         prev_duration = task_result.get('duration_seconds', 0)
@@ -353,16 +417,46 @@ class WorkflowEnv(gym.Env):
         prev_ram_allocated_gb = task_result.get('ram_allocated_gb', 1)
         obs_vec[6] = min(prev_ram_util_gb / prev_ram_allocated_gb if prev_ram_allocated_gb > 0 else 0.0, 1.0)
 
-        # Features 7-10: Placeholder for s_hist_perf (avg duration, avg cost, avg cpu, avg ram for this task type)
-        # This would require storing and updating historical metrics over episodes/tasks.
-        # For now, using zeros or fixed small values.
-        # In a real system, you'd query historical_performance or a database.
-        obs_vec[7:11] = 0.0 # Placeholder for historical performance
+        # Features 7-10: Historical Performance
+        avg_hist_duration = 0.0
+        avg_hist_cost = 0.0
+        avg_hist_cpu_util = 0.0
+        avg_hist_ram_util = 0.0
 
-        # Feature 11: Placeholder for s_cluster_load (e.g., # of active/pending tasks, available resources)
-        # This would require querying Ray's internal API or K8s API.
-        # For now, using zero or fixed small value.
-        obs_vec[11] = 0.0 # Placeholder for cluster load
+        if current_task_def:
+            task_type_history = self.historical_performance.get(current_task_def['type'])
+            if task_type_history:
+                if task_type_history['durations']:
+                    avg_hist_duration = statistics.mean(task_type_history['durations'])
+                if task_type_history['costs']:
+                    avg_hist_cost = statistics.mean(task_type_history['costs'])
+                if task_type_history['cpu_utils']:
+                    avg_hist_cpu_util = statistics.mean(task_type_history['cpu_utils'])
+                if task_type_history['ram_utils']:
+                    avg_hist_ram_util = statistics.mean(task_type_history['ram_utils'])
+
+        obs_vec[7] = min(avg_hist_duration / self.normalization_constants['max_duration_seconds'], 1.0)
+        obs_vec[8] = min(avg_hist_cost / self.normalization_constants['max_cost'], 1.0)
+        obs_vec[9] = avg_hist_cpu_util  # Assumes CPU util is already 0-1
+        obs_vec[10] = avg_hist_ram_util # Assumes RAM util here is also a 0-1 ratio
+
+        # Feature 11: Cluster Load
+        try:
+            cluster_resources = ray.cluster_resources()
+            total_cpus = cluster_resources.get('CPU', 0.0)
+            available_cpus = ray.available_resources().get('CPU', 0.0)
+
+            if total_cpus > 0:
+                cluster_cpu_load = (total_cpus - available_cpus) / total_cpus
+            else:
+                cluster_cpu_load = 0.0
+
+            max_load_norm = self.normalization_constants.get('max_cluster_load_percent', 1.0)
+            obs_vec[11] = min(cluster_cpu_load / max_load_norm, 1.0)
+
+        except Exception as e:
+            print(f"[EnvObs] Error getting Ray cluster resources: {e}")
+            obs_vec[11] = 0.0
 
         return obs_vec
 

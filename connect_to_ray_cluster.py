@@ -3,14 +3,20 @@ from google.cloud import aiplatform_v1beta1 as aiplatform
 from vertex_ray import get_ray_cluster
 import time
 import os
+import argparse
 
-# --- Configuration ---
-# !!! IMPORTANT: REPLACE THESE WITH YOUR ACTUAL VALUES !!!
-PROJECT_ID = "rsabawi-hpc-sandbox-926388" # Your GCP Project ID
-LOCATION = "us-central1"           # Your desired GCP region
-CLUSTER_NAME = "bioflow-20250603-002657" # The name of your existing Ray cluster
-# GCS path where you uploaded your Python scripts and gcsfuse_startup.sh
-CODE_GCS_PATH = f"gs://{PROJECT_ID}-genomics-results/code/"
+# --- Configuration via Arguments ---
+parser = argparse.ArgumentParser(description="Connect to an existing Vertex AI Ray cluster.")
+parser.add_argument("--project-id", required=True, help="Your GCP Project ID")
+parser.add_argument("--location", required=True, help="GCP region for the cluster (e.g., us-central1)")
+parser.add_argument("--cluster-name", required=True, help="Name of the existing Ray cluster")
+parser.add_argument("--code-gcs-path", required=True, help="GCS path to the code directory (e.g., gs://bucket/code/)")
+args = parser.parse_args()
+
+PROJECT_ID = args.project_id
+LOCATION = args.location
+CLUSTER_NAME = args.cluster_name
+CODE_GCS_PATH = args.code_gcs_path
 
 # --- 1. Get Info of the Existing Ray Cluster ---
 print(f"Getting info for existing Ray cluster '{CLUSTER_NAME}' in {LOCATION} for project {PROJECT_ID}...")
