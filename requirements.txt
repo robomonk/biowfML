@@ -4,3 +4,4 @@ numpy
 google-cloud-storage
 psutil
 pandas # For potential data processing in your state features
+pyyaml
