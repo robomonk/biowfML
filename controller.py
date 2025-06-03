@@ -1,5 +1,5 @@
 import ray
-from ray.rllib.algorithms.a3c import A3CConfig
+from ray.rllib.algorithms.ppo import PPOConfig # Changed A3C to PPO
 from ray.air.config import RunConfig # Added RunConfig
 from ray.tune.registry import register_env
 import os
@@ -51,14 +51,31 @@ if __name__ == "__main__":
     gcs_paths = PIPELINE_CONFIG['gcs_paths']
 
     # Determine GCS paths for TensorBoard logs and Checkpoints
-    TENSORBOARD_LOG_DIR = gcs_paths['tensorboard_log_bucket'] + "/tensorboard_logs/"
-    CHECKPOINT_DIR = gcs_paths['tensorboard_log_bucket'] + "/checkpoints/" # Using same bucket for simplicity
+    # Ensure they are full GCS URIs
+    base_gcs_bucket = gcs_paths['tensorboard_log_bucket']
+    if not base_gcs_bucket.startswith("gs://"):
+        # Assuming it's just a bucket name, prepend gs://, otherwise, this logic might need adjustment
+        # if tensorboard_log_bucket could be a sub-path itself. For now, assume it's a bucket name.
+        # However, the config.yaml implies it's just the bucket name.
+        base_gcs_bucket = f"gs://{base_gcs_bucket}"
+
+    TENSORBOARD_LOG_DIR = f"{base_gcs_bucket.rstrip('/')}/tensorboard_logs/"
+    CHECKPOINT_DIR = f"{base_gcs_bucket.rstrip('/')}/checkpoints/"
 
     # --- 2. Initialize Ray ---
     # Connect to the existing Ray cluster
     try:
-        ray.init(address=args.ray_address, ignore_reinit_error=True)
-        logger.info(f"Ray initialized with address: {ray.get_head_address()}")
+        # Pass the current directory to workers, so they can find workflow_env and utils
+        # This assumes controller.py, workflow_env.py, and utils.py are in the same directory.
+        # For a more robust solution with complex project structures, consider packaging.
+        import sys
+        current_script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Set working_dir for workers to the directory containing the scripts.
+        # This helps ensure that workflow_env.py and utils.py are importable.
+        runtime_env = {"working_dir": current_script_dir}
+
+        ray.init(address=args.ray_address, ignore_reinit_error=True, runtime_env=runtime_env)
+        # logger.info(f"Ray initialized with address: {ray.get_head_address()}") # Commented out, problematic with Ray Client
     except Exception as e:
         logger.exception("Error initializing Ray:")
         exit(1)
@@ -68,11 +85,12 @@ if __name__ == "__main__":
     register_env("WorkflowEnv", lambda env_config: WorkflowEnv(env_config))
     logger.info("WorkflowEnv registered with RLlib.")
 
-    # --- 4. Configure RLlib A3C Algorithm ---
-    config = (
-        A3CConfig()
+    # --- 4. Configure RLlib PPO Algorithm --- # Changed A3C to PPO
+    # First, create the PPOConfig object with all chained settings
+    ppo_config_object = (
+        PPOConfig() # Changed A3CConfig to PPOConfig
         .environment(env="WorkflowEnv", env_config={'pipeline_config': PIPELINE_CONFIG}) # Pass full config to env
-        .rollouts(num_rollout_workers=args.num_workers) # Number of parallel environments
+        .env_runners(num_env_runners=args.num_workers) # Changed from .rollouts()
         .framework("torch") # Use PyTorch for the neural network
         .training(
             gamma=rl_config_params.get('gamma', 0.99), # Discount factor
@@ -82,23 +100,24 @@ if __name__ == "__main__":
             },
             entropy_coeff=rl_config_params.get('entropy_coeff', 0.01), # Encourage exploration
             vf_loss_coeff=rl_config_params.get('vf_loss_coeff', 0.5), # Value function loss coefficient
-            n_step_max=rl_config_params.get('n_step_max', 50), # N-step returns
-            run_config=RunConfig(
-                storage_path=TENSORBOARD_LOG_DIR,
-                name="a3c_workflow_training", # Optional: experiment name
-            )
+            # n_step_max=rl_config_params.get('n_step_max', 50), # N-step returns (Removed for PPO)
         )
+        # RunConfig parameters like storage_path and name are typically handled by Tuner or higher-level Trainable.
+        # For direct Algo usage, results often go to a default local dir (e.g. ~/ray_results/exp_name)
+        # We will rely on algo.save(checkpoint_dir=CHECKPOINT_DIR) for explicit checkpointing.
+        # Tensorboard logging location might need to be inferred from algo.logdir or configured differently.
         .resources(num_gpus=rl_config_params.get('num_gpus', 0)) # Set 0 if no GPUs, >0 if GPUs for NN training
         .debugging(log_level="INFO") # Set log level
-        .build() # Build the algorithm configuration
+        # Removed .build() from the end of the config chain
     )
 
     # Ensure correct observation and action spaces are set (for debugging)
-    # print(f"Observation space: {config.observation_space}")
-    # print(f"Action space: {config.action_space}")
+    # print(f"Observation space: {ppo_config_object.observation_space}") # Would need to build env first or get from built algo
+    # print(f"Action space: {ppo_config_object.action_space}")
 
     # --- 5. Build and Train the Algorithm ---
-    algo = config.build() # Build the algorithm instance
+    # Build the algorithm instance from the config object
+    algo = ppo_config_object.build_algo()
 
     # Setup TensorBoard logging to GCS
     # RLlib's Logger.log_dir is the base for TensorBoard event files
