@@ -1,0 +1,77 @@
+# config.yaml
+
+# --- GCS Paths ---
+gcs_paths:
+  input_reads_bucket: "your-project-id-genomics-reads"
+  input_refs_bucket: "your-project-id-genomics-refs"
+  output_results_bucket: "your-project-id-genomics-results"
+  tensorboard_log_bucket: "your-project-id-tensorboard-logs" # <--- ADD THIS LINE
+
+  # Base GCS FUSE mount path on Ray worker nodes.
+  # This is the local directory where GCS buckets will be mounted.
+  # E.g., if gs://my-bucket is mounted, it would appear as /mnt/gcs/my-bucket/
+  gcs_fuse_mount_base: "/mnt/gcs/"
+
+# --- Input Files (relative paths within their respective buckets) ---
+# These will be combined with the bucket names from gcs_paths to form full GCS URIs.
+input_files:
+  transcriptome_ref: "transcript.fa"
+  read1: "gut_1.fq"
+  read2: "gut_2.fq"
+
+# --- Output Prefixes (relative paths within the output_results_bucket) ---
+output_prefixes:
+  aligned_bams: "aligned_bams/"
+  multiqc_reports: "multiqc_reports/"
+
+# --- Tool Images (Docker Hub or Google Container Registry paths) ---
+# These are the Docker images that `run_task.py` will use to execute the genomics tools.
+tool_images:
+  bwa_mem: "biocontainers/bwa:0.7.17--he4a0461_8" # REPLACE with your BWA image
+  samtools_sort: "biocontainers/samtools:1.16.1--h3840ad3_1" # REPLACE with your Samtools image
+  # Add other tool images here as you expand the pipeline
+
+# --- Workflow Definition (Sequence of abstract tasks) ---
+# This defines the high-level steps of your genomics pipeline.
+# The DRL agent will make resource allocation decisions for each of these.
+workflow_definition:
+  - task_id_prefix: "bwa-align" # A prefix for the unique ID given to this task type
+    type: "bwa_mem"             # Corresponds to a key in `tool_images`
+    # Inputs defined here are the *logical* inputs.
+    # The WorkflowEnv will resolve them to actual file paths (GCS or mounted).
+    inputs:
+      ref: "${gcs_paths.input_refs_bucket}/${input_files.transcriptome_ref}"
+      read1: "${gcs_paths.input_reads_bucket}/${input_files.read1}"
+      read2: "${gcs_paths.input_reads_bucket}/${input_files.read2}"
+    # Where the output of this task should be stored in GCS
+    output_prefix: "${gcs_paths.output_results_bucket}/${output_prefixes.aligned_bams}"
+    # A flag indicating if this task produces an output that can be used by downstream tasks
+    produces_primary_output: True # e.g., an aligned BAM
+
+  - task_id_prefix: "samtools-sort"
+    type: "samtools_sort"
+    inputs:
+      # This input is dynamic: it will be the output from the previous `bwa-align` task
+      # The WorkflowEnv will handle passing the resolved GCS path.
+      input_bam: "dynamic_from_previous_task"
+    output_prefix: "${gcs_paths.output_results_bucket}/${output_prefixes.aligned_bams}"
+    produces_primary_output: True # A sorted BAM
+
+# --- RL Specific Configuration (initial placeholders) ---
+rl_config:
+  action_tiers:
+    0: {cpu: 1, ram_gb: 4}
+    1: {cpu: 2, ram_gb: 8}
+    2: {cpu: 4, ram_gb: 16}
+
+  reward_weights:
+    success: 10.0
+    cost: -1.0
+    time: -0.5
+    utilization: 0.2 # Placeholder, needs actual utilization reporting
+
+  state_normalization_constants:
+    max_duration_seconds: 3600 # 1 hour
+    max_cost: 0.5             # 50 cents
+    max_input_size_gb: 100    # 100 GB
+    max_cluster_load_percent: 100 # Placeholder for advanced state
