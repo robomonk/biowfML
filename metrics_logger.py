@@ -2,6 +2,10 @@ import ray
 from google.cloud import storage
 import json
 import os
+import logging
+from utils import parse_gcs_uri, InvalidGCSPathError # Added
+
+logger = logging.getLogger(__name__)
 
 @ray.remote
 class MetricsLogger:
@@ -13,14 +17,25 @@ class MetricsLogger:
             gcs_log_dir (str): The GCS directory path (e.g., 'gs://your-results-bucket/logs/')
                                where task metrics will be stored.
         """
-        if not gcs_log_dir.startswith("gs://"):
+        if not gcs_log_dir.startswith("gs://"): # Initial check retained for immediate feedback
+            logger.error(f"gcs_log_dir must be a GCS path starting with 'gs://'. Got: {gcs_log_dir}")
             raise ValueError("gcs_log_dir must be a GCS path starting with 'gs://'")
-        self.gcs_log_dir = gcs_log_dir.rstrip('/') + '/'
-        self.bucket_name = self.gcs_log_dir.split('//')[1].split('/')[0]
-        self.blob_prefix = '/'.join(self.gcs_log_dir.split('/')[3:])
+
+        self.gcs_log_dir = gcs_log_dir.rstrip('/') + '/' # Ensure trailing slash for consistency
+
+        try:
+            self.bucket_name, self.blob_prefix = parse_gcs_uri(self.gcs_log_dir)
+            # parse_gcs_uri might return an empty blob_prefix if the path is just "gs://bucket/",
+            # ensure blob_prefix ends with a slash if it's not empty, for os.path.join compatibility.
+            if self.blob_prefix and not self.blob_prefix.endswith('/'):
+                self.blob_prefix += '/'
+        except InvalidGCSPathError as e:
+            logger.error(f"Invalid GCS log directory URI in MetricsLogger: {self.gcs_log_dir} - {e}")
+            raise # Re-raise to prevent actor from starting with bad config
+
         self.storage_client = storage.Client()
         self.bucket = self.storage_client.bucket(self.bucket_name)
-        print(f"MetricsLogger initialized. Logging to: {self.gcs_log_dir}")
+        logger.info(f"MetricsLogger initialized. Logging to: {self.gcs_log_dir} (Bucket: {self.bucket_name}, Prefix: {self.blob_prefix})")
 
     def log_task_metrics(self, metrics: dict):
         """
@@ -37,9 +52,9 @@ class MetricsLogger:
         try:
             blob = self.bucket.blob(blob_path)
             blob.upload_from_string(json.dumps(metrics, indent=2), content_type="application/json")
-            print(f"Logged metrics for task {task_id} to {self.gcs_log_dir}{file_name}")
+            logger.info(f"Logged metrics for task {task_id} to {self.gcs_log_dir}{file_name}")
         except Exception as e:
-            print(f"Error logging metrics for task {task_id} to GCS: {e}")
+            logger.exception(f"Error logging metrics for task {task_id} to GCS:")
 
     def get_all_logged_task_ids(self):
         """

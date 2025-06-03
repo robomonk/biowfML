@@ -6,6 +6,7 @@ import os
 import argparse
 import yaml
 from google.cloud import storage # Added for GCS upload
+import logging # Added logging
 
 # --- Configuration via Arguments ---
 parser = argparse.ArgumentParser(description="Create a new Vertex AI Ray cluster.")
@@ -24,7 +25,16 @@ SERVICE_ACCOUNT_EMAIL = args.service_account_email
 CODE_GCS_PATH = args.code_gcs_path
 CONFIG_FILE = args.config_file
 
+# --- Basic Logging Configuration ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
 # --- Dynamically Generate gcsfuse_startup.sh ---
+logger.info(f"Loading pipeline configuration from: {CONFIG_FILE}")
 with open(CONFIG_FILE, 'r') as f:
     pipeline_config = yaml.safe_load(f)
 
@@ -42,7 +52,7 @@ if 'gcs_paths' in pipeline_config:
              gcs_buckets_to_mount.append(value)
 
 gcs_buckets_to_mount = sorted(list(set(gcs_buckets_to_mount))) # Unique, sorted
-print(f"Buckets to FUSE mount: {gcs_buckets_to_mount}")
+logger.info(f"Buckets to FUSE mount: {gcs_buckets_to_mount}")
 
 bucket_list_str = "\n".join([f"    \"{b}\"" for b in gcs_buckets_to_mount]) # Format for bash array
 
@@ -93,7 +103,7 @@ bucket_obj = storage_client.bucket(code_bucket_name)
 blob_obj = bucket_obj.blob(blob_path_in_bucket)
 blob_obj.upload_from_filename(generated_script_local_path)
 startup_script_final_uri = f"gs://{code_bucket_name}/{blob_path_in_bucket}"
-print(f"Uploaded generated startup script to {startup_script_final_uri}")
+logger.info(f"Uploaded generated startup script to {startup_script_final_uri}")
 
 # --- 1. Define Ray Cluster Resources ---
 head_node_type = Resources(
@@ -110,7 +120,7 @@ worker_node_types = [
 ]
 
 # --- 2. Create the Ray Cluster ---
-print(f"Creating Ray cluster '{CLUSTER_NAME}' in {LOCATION} for project {PROJECT_ID}...")
+logger.info(f"Creating Ray cluster '{CLUSTER_NAME}' in {LOCATION} for project {PROJECT_ID}...")
 
 ray_cluster_name = None # Initialize to None for cleanup in case of partial creation
 try:
@@ -125,7 +135,7 @@ try:
         requirements_uris=[os.path.join(CODE_GCS_PATH, "requirements.txt")], # Assuming requirements.txt is also in CODE_GCS_PATH
         working_dir=CODE_GCS_PATH,
     )
-    print(f"Ray cluster creation initiated: {ray_cluster_name}. This may take 5-10 minutes.")
+    logger.info(f"Ray cluster creation initiated: {ray_cluster_name}. This may take 5-10 minutes.")
 
     # --- 3. Wait for Cluster to be Ready and Connect ---
     status = None
@@ -136,13 +146,14 @@ try:
             cluster_name=CLUSTER_NAME
         )
         status = cluster_info.state.name
-        print(f"Cluster status: {status}...")
+        logger.info(f"Cluster status: {status}...")
         if status == "ERROR":
+            logger.error(f"Ray cluster failed to start. Details: {cluster_info.error}")
             raise Exception(f"Ray cluster failed to start. Details: {cluster_info.error}")
         if status != "RUNNING":
             time.sleep(30) # Wait 30 seconds before checking again
 
-    print(f"Ray cluster '{CLUSTER_NAME}' is RUNNING. Connecting...")
+    logger.info(f"Ray cluster '{CLUSTER_NAME}' is RUNNING. Connecting...")
 
     # Initialize Ray client to connect to the newly created cluster
     ray.init(
@@ -151,15 +162,15 @@ try:
             "working_dir": CODE_GCS_PATH,
         }
     )
-    print("Successfully connected to Ray cluster.")
-    print(f"Ray Dashboard: {cluster_info.dashboard_address}")
+    logger.info("Successfully connected to Ray cluster.")
+    logger.info(f"Ray Dashboard: {cluster_info.dashboard_address}")
 
 except Exception as e:
-    print(f"Failed to create or connect to Ray cluster: {e}")
+    logger.exception("Failed to create or connect to Ray cluster:")
     if ray_cluster_name:
-        print(f"Attempting to delete partially created/failed cluster: {ray_cluster_name}")
+        logger.warning(f"Attempting to delete partially created/failed cluster: {ray_cluster_name}")
         try:
             delete_ray_cluster(project_id=PROJECT_ID, location=LOCATION, cluster_name=CLUSTER_NAME)
-            print("Cluster deleted.")
+            logger.info("Cluster deleted.")
         except Exception as delete_e:
-            print(f"Failed to delete cluster: {delete_e}")
+            logger.exception(f"Failed to delete cluster {ray_cluster_name}:")

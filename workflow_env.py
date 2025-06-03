@@ -5,10 +5,17 @@ import uuid
 import os
 import time
 from google.cloud import storage
-import subprocess
+# import subprocess # Removed
 import statistics # Added for calculating mean
+import logging # Added logging
 from run_task import run_computational_task # Corrected import to the right function
 from metrics_logger import MetricsLogger # Import MetricsLogger for use
+from utils import parse_gcs_uri, InvalidGCSPathError # Added
+
+logger = logging.getLogger(__name__)
+
+class StagingErrorException(Exception):
+    pass
 
 class WorkflowEnv(gym.Env):
     metadata = {'render.modes': ['human']}
@@ -83,7 +90,7 @@ class WorkflowEnv(gym.Env):
             if resolved_path and resolved_path.startswith("gs://"):
                 task_input_gcs_uris.append(resolved_path)
             elif resolved_path: # Could be a local path if workflow changes, log a warning
-                print(f"[EnvObs] Warning: Resolved input path {resolved_path} is not a GCS URI for size calculation.")
+                logger.warning(f"Resolved input path {resolved_path} is not a GCS URI for size calculation.")
 
         return task_input_gcs_uris
 
@@ -97,18 +104,23 @@ class WorkflowEnv(gym.Env):
         storage_client = storage.Client()
         staging_bucket_obj = storage_client.bucket(self.staging_bucket)
 
-        print(f"[Env] Staging data for run ID: {self.run_id}")
+        logger.info(f"Staging data for run ID: {self.run_id}")
 
         for input_key, source_gcs_path_template in self.input_sources.items():
             source_gcs_path = source_gcs_path_template # For input_sources, these are already full GCS paths
 
             # Extract source bucket name and blob name from the GCS URI
-            if not source_gcs_path.startswith("gs://"):
-                raise ValueError(f"Input source path must start with 'gs://': {source_gcs_path}")
+            if not source_gcs_path.startswith("gs://"): # This check is good, but parse_gcs_uri also validates
+                logger.error(f"Invalid source GCS path in input_sources (must start with gs://): {source_gcs_path}")
+                self.staged_gcs_input_paths[input_key] = None
+                raise StagingErrorException(f"Invalid GCS path for staging: {source_gcs_path}")
 
-            source_parts = source_gcs_path.split('//')[1].split('/', 1)
-            source_bucket_name = source_parts[0]
-            source_blob_name = source_parts[1] if len(source_parts) > 1 else ''
+            try:
+                source_bucket_name, source_blob_name = parse_gcs_uri(source_gcs_path)
+            except InvalidGCSPathError as e:
+                logger.error(f"Invalid source GCS path in input_sources: {source_gcs_path} - {e}")
+                self.staged_gcs_input_paths[input_key] = None
+                raise StagingErrorException(f"Invalid GCS path for staging: {source_gcs_path} - {e}") from e
 
             # Destination path within your staging bucket for this unique run
             destination_blob_name = os.path.join(self.run_id, source_blob_name)
@@ -116,7 +128,7 @@ class WorkflowEnv(gym.Env):
             # Check if destination already exists (for idempotency if run_id is reused)
             destination_blob = staging_bucket_obj.blob(destination_blob_name)
             if destination_blob.exists():
-                print(f"[Env] File gs://{self.staging_bucket}/{destination_blob_name} already exists. Skipping copy.")
+                logger.info(f"File gs://{self.staging_bucket}/{destination_blob_name} already exists. Skipping copy.")
                 self.staged_gcs_input_paths[input_key] = f"gs://{self.staging_bucket}/{destination_blob_name}"
                 continue
 
@@ -130,10 +142,10 @@ class WorkflowEnv(gym.Env):
                 while token[0] is not None:
                     token = source_blob_obj.rewrite(destination_blob, token=token[0])
 
-                print(f"[Env] Copied {source_gcs_path} to gs://{self.staging_bucket}/{destination_blob_name}")
+                logger.info(f"Copied {source_gcs_path} to gs://{self.staging_bucket}/{destination_blob_name}")
                 self.staged_gcs_input_paths[input_key] = f"gs://{self.staging_bucket}/{destination_blob_name}"
             except Exception as e:
-                print(f"[Env] Error copying {source_gcs_path} to staging: {e}")
+                logger.exception(f"Error copying {source_gcs_path} to staging for run_id {self.run_id}:")
                 self.staged_gcs_input_paths[input_key] = None # Mark as failed
                 raise # Re-raise to stop episode if staging fails critically
 
@@ -142,7 +154,7 @@ class WorkflowEnv(gym.Env):
         Resets the environment for a new episode.
         Stages data and prepares the first task.
         """
-        print("\n[Env] Resetting environment for a new episode...")
+        logger.info("Resetting environment for a new episode...")
         self.current_task_idx = 0
         self.last_task_output_path = None # Reset output from previous episode
         self.staged_gcs_input_paths = {} # Reset staged paths
@@ -155,11 +167,13 @@ class WorkflowEnv(gym.Env):
         # Stage data from public sources to our staging bucket for this run
         try:
             self._stage_data()
-        except Exception as e:
-            print(f"[Env] FATAL ERROR during data staging: {e}. Cannot proceed with episode.")
-            # Return an observation that indicates failure and potentially end episode (done=True)
-            return np.zeros(self.observation_space.shape, dtype=np.float32) # Indicate failure state
-            # Or raise an exception if you want to stop the training.
+        except StagingErrorException: # Already logged in _stage_data or if it's a different exception
+            logger.exception(f"A StagingErrorException occurred during reset for run_id {self.run_id}. Cannot proceed.")
+            raise # Re-raise to be handled by the agent/training loop
+        except Exception as e: # Catch any other unexpected errors during staging setup
+            logger.exception(f"Unexpected FATAL ERROR during data staging setup for run_id {self.run_id}: {e}")
+            # Convert to StagingErrorException or a more generic EnvSetupException if needed
+            raise StagingErrorException(f"Unexpected data staging setup failed for run_id {self.run_id}: {e}") from e
 
         # Get the first task definition in the workflow
         first_task_def = self.workflow_definition[self.current_task_idx]
@@ -171,7 +185,7 @@ class WorkflowEnv(gym.Env):
             attempt_num=0,
             run_id=self.run_id
         )
-        print(f"[Env] Reset complete. Initial observation: {initial_observation}")
+        logger.info(f"Reset complete. Initial observation: {initial_observation}")
         return initial_observation
 
     def step(self, action):
@@ -194,7 +208,7 @@ class WorkflowEnv(gym.Env):
         cpu_allocation = self.action_tiers[action]['cpu']
         ram_allocation_gb = self.action_tiers[action]['ram_gb']
 
-        print(f"\n[Env] Step {self.current_task_idx+1}/{len(self.workflow_definition)}: Task '{task_type}' (ID: {task_id}) with action {action} (CPU={cpu_allocation}, RAM={ram_allocation}GB)")
+        logger.info(f"Step {self.current_task_idx+1}/{len(self.workflow_definition)}: Task '{task_type}' (ID: {task_id}) with action {action} (CPU={cpu_allocation}, RAM={ram_allocation_gb}GB)")
 
         # --- Resolve Input Paths for the current task ---
         # Inputs can be from staged data or output of previous tasks.
@@ -244,9 +258,9 @@ class WorkflowEnv(gym.Env):
                 self.config # Pass the full pipeline config to run_task
             )
             task_result = ray.get(task_ref) # Wait for the task to complete
-            print(f"[Env] Task {task_id} completed. Success: {task_result['success']}")
+            logger.info(f"Task {task_id} completed. Success: {task_result['success']}")
         except Exception as e:
-            print(f"[Env] Error running task {task_id}: {e}")
+            logger.exception(f"Error running task {task_id} via Ray:")
             # Create a failed task result to allow reward calculation and episode continuation/termination
             task_result = {
                 "task_id": task_id, "task_type": task_type, "duration_seconds": -1,
@@ -283,11 +297,17 @@ class WorkflowEnv(gym.Env):
         self.last_task_result = task_result
         self.last_task_output_path = None # Reset for the next task
         if task_result['success'] and current_task_def.get('produces_primary_output', False):
-            # The primary output is what the next task might consume.
-            # Assuming the first value in output_files is the primary one.
-            if task_result['output_files']:
-                self.last_task_output_path = next(iter(task_result['output_files'].values()))
-            print(f"[Env] Primary output from '{task_type}' (ID: {task_id}): {self.last_task_output_path}")
+            primary_key = current_task_def.get('primary_output_key')
+            task_outputs = task_result.get('output_files', {})
+            if primary_key and primary_key in task_outputs:
+                self.last_task_output_path = task_outputs[primary_key]
+                logger.info(f"Primary output from '{task_type}' (ID: {task_id}) using key '{primary_key}': {self.last_task_output_path}")
+            elif primary_key: # Key was specified but not found in outputs
+                logger.warning(f"Task {task_id} ('{task_type}') was marked 'produces_primary_output' with key '{primary_key}', but key not found in task_result['output_files'] ({list(task_outputs.keys())}). No primary output set.")
+                self.last_task_output_path = None # Explicitly set to None
+            else: # produces_primary_output was true, but no key specified in config
+                logger.warning(f"Task {task_id} ('{task_type}') is marked 'produces_primary_output' but 'primary_output_key' is missing in its definition in config.yaml. Cannot determine primary output. No primary output set.")
+                self.last_task_output_path = None # Explicitly set to None
 
         # --- Calculate Reward ---
         reward = self._calculate_reward(task_result)
@@ -350,7 +370,7 @@ class WorkflowEnv(gym.Env):
 
         total_reward = r_success + r_cost + r_time + r_util
 
-        print(f"[Env] Reward components - Success: {r_success:.2f}, Cost: {r_cost:.2f}, Time: {r_time:.2f}, Util: {r_util:.2f} -> Total Reward: {total_reward:.2f}")
+        logger.info(f"Reward components for task {task_id} - Success: {r_success:.2f}, Cost: {r_cost:.2f}, Time: {r_time:.2f}, Util: {r_util:.2f} -> Total Reward: {total_reward:.2f}")
 
         return float(total_reward)
 
@@ -383,18 +403,22 @@ class WorkflowEnv(gym.Env):
         if current_task_def and current_task_input_gcs_uris:
             for gcs_uri in current_task_input_gcs_uris:
                 try:
-                    bucket_name = gcs_uri.split('//')[1].split('/')[0]
-                    blob_name = '/'.join(gcs_uri.split('/')[3:])
-                    if blob_name:
+                    bucket_name, blob_name = parse_gcs_uri(gcs_uri)
+                    if blob_name: # Ensure blob_name is not empty (e.g. for bucket root, though unlikely for files)
                         blob = self.gcs_client.bucket(bucket_name).get_blob(blob_name)
                         if blob and blob.size is not None:
                             total_input_bytes += blob.size
                         else:
-                            print(f"[EnvObs] Warning: Could not get blob or size for {gcs_uri}")
-                    else:
-                        print(f"[EnvObs] Warning: Invalid blob name from GCS URI {gcs_uri}")
-                except Exception as e:
-                    print(f"[EnvObs] Error getting size for GCS URI {gcs_uri}: {e}")
+                            logger.warning(f"Could not get blob or size for GCS URI {gcs_uri} when calculating observation.")
+                    else: # blob_name is empty, means it's likely just "gs://bucket/"
+                        logger.warning(f"Skipping GCS URI with empty blob name for size calculation: {gcs_uri}")
+                        continue # Skip to next URI
+                except InvalidGCSPathError as e:
+                    logger.warning(f"Skipping invalid GCS URI for size calculation: {gcs_uri} - {e}")
+                    continue # Skip this URI
+                except Exception as e: # Catch other potential errors from GCS client
+                    logger.error(f"Error accessing GCS URI {gcs_uri} for size calculation: {e}")
+                    continue # Skip this URI
 
         total_input_gb = total_input_bytes / (1024**3)
         max_input_gb = self.normalization_constants.get('max_input_size_gb', 100.0)
@@ -455,7 +479,7 @@ class WorkflowEnv(gym.Env):
             obs_vec[11] = min(cluster_cpu_load / max_load_norm, 1.0)
 
         except Exception as e:
-            print(f"[EnvObs] Error getting Ray cluster resources: {e}")
+            logger.error(f"Error getting Ray cluster resources for observation: {e}")
             obs_vec[11] = 0.0
 
         return obs_vec
@@ -463,10 +487,16 @@ class WorkflowEnv(gym.Env):
 
     def render(self, mode='human'):
         # Optional: Print current state or task info
-        if hasattr(self, 'current_task_idx') and self.current_task_idx > 0 and self.last_task_result:
-            print(f"Env State - Current Task Index: {self.current_task_idx}, Last Reward: {self._calculate_reward(self.last_task_result):.2f}")
+        if hasattr(self, 'last_task_result') and self.last_task_result: # Check if last_task_result exists
+             current_task_desc = f"Task Index: {self.current_task_idx}"
+             if self.current_task_idx < len(self.workflow_definition):
+                 current_task_desc = f"Next Task: {self.workflow_definition[self.current_task_idx]['type']}"
+             else:
+                 current_task_desc = "Workflow Complete"
+
+             logger.info(f"Render Env State - {current_task_desc}, Last Reward: {self._calculate_reward(self.last_task_result):.2f}")
         else:
-            print("Env State - Initializing/Waiting for first task...")
+             logger.info("Render Env State - Initializing or no task processed yet.")
 
 
     def close(self):
