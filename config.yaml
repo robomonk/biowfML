@@ -2,62 +2,62 @@
 
 # --- GCS Paths ---
 gcs_paths:
-  input_reads_bucket: "your-project-id-genomics-reads"
-  input_refs_bucket: "your-project-id-genomics-refs"
-  output_results_bucket: "your-project-id-genomics-results"
-  tensorboard_log_bucket: "your-project-id-tensorboard-logs" # <--- ADD THIS LINE
+  # Your project's core buckets (outputs, logs)
+  output_results_bucket: "rsabawi-hpc-sandbox-926388-genomics-results"
+  tensorboard_log_bucket: "rsabawi-hpc-sandbox-926388-tensorboard-logs"
+
+  # NEW: Your dedicated staging bucket for dynamic public data copies
+  staging_bucket: "rsabawi-hpc-sandbox-926388-staging-area"
 
   # Base GCS FUSE mount path on Ray worker nodes.
   # This is the local directory where GCS buckets will be mounted.
   # E.g., if gs://my-bucket is mounted, it would appear as /mnt/gcs/my-bucket/
   gcs_fuse_mount_base: "/mnt/gcs/"
 
-# --- Input Files (relative paths within their respective buckets) ---
-# These will be combined with the bucket names from gcs_paths to form full GCS URIs.
-input_files:
-  transcriptome_ref: "transcript.fa"
-  read1: "gut_1.fq"
-  read2: "gut_2.fq"
+# --- Input Sources (Public GCS paths or other accessible locations) ---
+# These define the *source* of the data that will be copied to your staging_bucket.
+input_sources:
+  # Public RNA-Seq Gallus Gallus data
+  rnaseq_chicken_ref: "gs://rnaseq-nf/data/ggal/transcript.fa"
+  rnaseq_chicken_read1: "gs://rnaseq-nf/data/ggal/gut_1.fq"
+  rnaseq_chicken_read2: "gs://rnaseq-nf/data/ggal/gut_2.fq"
 
-# --- Output Prefixes (relative paths within the output_results_bucket) ---
-output_prefixes:
-  aligned_bams: "aligned_bams/"
-  multiqc_reports: "multiqc_reports/"
+  # Add other public dataset sources here as needed, e.g.:
+  # human_ref: "gs://gcp-public-data--broad-references/hg38/v0/Homo_sapiens_assembly38.fasta"
+  # human_reads_sample1_R1: "gs://your-public-reads-source/human_sample1_R1.fastq.gz"
 
 # --- Tool Images (Docker Hub or Google Container Registry paths) ---
-# These are the Docker images that `run_task.py` will use to execute the genomics tools.
 tool_images:
   bwa_mem: "biocontainers/bwa:0.7.17--he4a0461_8" # REPLACE with your BWA image
   samtools_sort: "biocontainers/samtools:1.16.1--h3840ad3_1" # REPLACE with your Samtools image
-  # Add other tool images here as you expand the pipeline
 
 # --- Workflow Definition (Sequence of abstract tasks) ---
-# This defines the high-level steps of your genomics pipeline.
-# The DRL agent will make resource allocation decisions for each of these.
 workflow_definition:
-  - task_id_prefix: "bwa-align" # A prefix for the unique ID given to this task type
-    type: "bwa_mem"             # Corresponds to a key in `tool_images`
-    # Inputs defined here are the *logical* inputs.
-    # The WorkflowEnv will resolve them to actual file paths (GCS or mounted).
+  - task_id_prefix: "bwa-align"
+    type: "bwa_mem"
+    # Input sources for *this specific workflow step* are now references to `input_sources`
     inputs:
-      ref: "${gcs_paths.input_refs_bucket}/${input_files.transcriptome_ref}"
-      read1: "${gcs_paths.input_reads_bucket}/${input_files.read1}"
-      read2: "${gcs_paths.input_reads_bucket}/${input_files.read2}"
-    # Where the output of this task should be stored in GCS
+      ref: "${input_sources.rnaseq_chicken_ref}"
+      read1: "${input_sources.rnaseq_chicken_read1}"
+      read2: "${input_sources.rnaseq_chicken_read2}"
+    # Output will go to a *dynamic subdirectory* within output_results_bucket
     output_prefix: "${gcs_paths.output_results_bucket}/${output_prefixes.aligned_bams}"
-    # A flag indicating if this task produces an output that can be used by downstream tasks
-    produces_primary_output: True # e.g., an aligned BAM
+    produces_primary_output: True
 
   - task_id_prefix: "samtools-sort"
     type: "samtools_sort"
     inputs:
-      # This input is dynamic: it will be the output from the previous `bwa-align` task
-      # The WorkflowEnv will handle passing the resolved GCS path.
-      input_bam: "dynamic_from_previous_task"
+      input_bam: "dynamic_from_previous_task" # This will be the path from the BWA output
     output_prefix: "${gcs_paths.output_results_bucket}/${output_prefixes.aligned_bams}"
-    produces_primary_output: True # A sorted BAM
+    produces_primary_output: True
 
-# --- RL Specific Configuration (initial placeholders) ---
+# --- Output Prefixes (relative paths within output_results_bucket) ---
+# These are prefixes for final results, not the staging area.
+output_prefixes:
+  aligned_bams: "aligned_bams/"
+  multiqc_reports: "multiqc_reports/"
+
+# --- RL Specific Configuration (initial placeholders) --- service-263885197854@gcp-sa-aiplatform-cc.iam.gserviceaccount.com
 rl_config:
   action_tiers:
     0: {cpu: 1, ram_gb: 4}
@@ -68,10 +68,10 @@ rl_config:
     success: 10.0
     cost: -1.0
     time: -0.5
-    utilization: 0.2 # Placeholder, needs actual utilization reporting
+    utilization: 0.2
 
   state_normalization_constants:
-    max_duration_seconds: 3600 # 1 hour
-    max_cost: 0.5             # 50 cents
-    max_input_size_gb: 100    # 100 GB
-    max_cluster_load_percent: 100 # Placeholder for advanced state
+    max_duration_seconds: 3600
+    max_cost: 0.5
+    max_input_size_gb: 100
+    max_cluster_load_percent: 100
