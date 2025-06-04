@@ -22,3 +22,9 @@ Enable concurrent execution of multiple tasks.
 
 Include full observability, task logging, and optional web-based monitoring.
 
+## Concurrency and Algorithm Selection
+
+Multiple workflow channels can be processed at once by launching several RLlib environment workers (`--num-workers` in `controller.py`). Each worker runs the pipeline independently so Ray executes tasks in parallel as soon as their inputs become available. The environment maintains an internal queue of pending Ray tasks and polls for completed jobs without blocking. As soon as a worker finishes, the next task is submitted, keeping the pipeline saturated up to the limit defined by `rl_config.max_concurrent_tasks` in `config.yaml`.
+
+The reinforcement learning algorithm is also configurable. Set `rl_config.algorithm` to `ppo`, `a3c`, or `dqn` to choose between Proximal Policy Optimization, Asynchronous Advantage Actor-Critic, or Deep Q-Network training respectively.
+
