@@ -1,5 +1,7 @@
 import ray
-from ray.rllib.algorithms.ppo import PPOConfig # Changed A3C to PPO
+from ray.rllib.algorithms.ppo import PPOConfig
+from ray.rllib.algorithms.a3c import A3CConfig
+from ray.rllib.algorithms.dqn import DQNConfig
 from ray.air.config import RunConfig # Added RunConfig
 from ray.tune.registry import register_env
 import os
@@ -85,39 +87,38 @@ if __name__ == "__main__":
     register_env("WorkflowEnv", lambda env_config: WorkflowEnv(env_config))
     logger.info("WorkflowEnv registered with RLlib.")
 
-    # --- 4. Configure RLlib PPO Algorithm --- # Changed A3C to PPO
-    # First, create the PPOConfig object with all chained settings
-    ppo_config_object = (
-        PPOConfig() # Changed A3CConfig to PPOConfig
-        .environment(env="WorkflowEnv", env_config={'pipeline_config': PIPELINE_CONFIG}) # Pass full config to env
-        .env_runners(num_env_runners=args.num_workers) # Changed from .rollouts()
-        .framework("torch") # Use PyTorch for the neural network
+    # --- 4. Configure RLlib Algorithm ---
+    algo_name = rl_config_params.get('algorithm', 'ppo').lower()
+    if algo_name == 'a3c':
+        algo_config = A3CConfig()
+    elif algo_name == 'dqn':
+        algo_config = DQNConfig()
+    else:
+        algo_config = PPOConfig()
+
+    algo_config = (
+        algo_config
+        .environment(env="WorkflowEnv", env_config={'pipeline_config': PIPELINE_CONFIG})
+        .env_runners(num_env_runners=args.num_workers)
+        .framework("torch")
         .training(
-            gamma=rl_config_params.get('gamma', 0.99), # Discount factor
-            lr=rl_config_params.get('learning_rate', 0.0001), # Learning rate
-            model={
-                "fcnet_hiddens": rl_config_params.get('fcnet_hiddens', [256, 256]) # NN hidden layers
-            },
-            entropy_coeff=rl_config_params.get('entropy_coeff', 0.01), # Encourage exploration
-            vf_loss_coeff=rl_config_params.get('vf_loss_coeff', 0.5), # Value function loss coefficient
-            # n_step_max=rl_config_params.get('n_step_max', 50), # N-step returns (Removed for PPO)
+            gamma=rl_config_params.get('gamma', 0.99),
+            lr=rl_config_params.get('learning_rate', 0.0001),
+            model={"fcnet_hiddens": rl_config_params.get('fcnet_hiddens', [256, 256])},
+            entropy_coeff=rl_config_params.get('entropy_coeff', 0.01),
+            vf_loss_coeff=rl_config_params.get('vf_loss_coeff', 0.5),
         )
-        # RunConfig parameters like storage_path and name are typically handled by Tuner or higher-level Trainable.
-        # For direct Algo usage, results often go to a default local dir (e.g. ~/ray_results/exp_name)
-        # We will rely on algo.save(checkpoint_dir=CHECKPOINT_DIR) for explicit checkpointing.
-        # Tensorboard logging location might need to be inferred from algo.logdir or configured differently.
-        .resources(num_gpus=rl_config_params.get('num_gpus', 0)) # Set 0 if no GPUs, >0 if GPUs for NN training
-        .debugging(log_level="INFO") # Set log level
-        # Removed .build() from the end of the config chain
+        .resources(num_gpus=rl_config_params.get('num_gpus', 0))
+        .debugging(log_level="INFO")
     )
 
     # Ensure correct observation and action spaces are set (for debugging)
-    # print(f"Observation space: {ppo_config_object.observation_space}") # Would need to build env first or get from built algo
-    # print(f"Action space: {ppo_config_object.action_space}")
+    # print(f"Observation space: {algo_config.observation_space}")
+    # print(f"Action space: {algo_config.action_space}")
 
     # --- 5. Build and Train the Algorithm ---
     # Build the algorithm instance from the config object
-    algo = ppo_config_object.build_algo()
+    algo = algo_config.build_algo()
 
     # Setup TensorBoard logging to GCS
     # RLlib's Logger.log_dir is the base for TensorBoard event files

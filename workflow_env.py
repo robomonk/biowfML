@@ -68,6 +68,11 @@ class WorkflowEnv(gym.Env):
         # For historical performance
         self.historical_performance = {} # {task_type: {'durations':[], 'costs':[], 'cpu_utils':[], 'ram_utils':[]}}
 
+        # Concurrency control
+        self.max_concurrent_tasks = self.config['rl_config'].get('max_concurrent_tasks', 1)
+        # Each pending task entry is (ray_ref, task_def, cpu, ram, task_id)
+        self.pending_tasks = []
+
     def _resolve_input_gcs_paths_for_observation(self, current_task_def: dict) -> list[str]:
         if not current_task_def:
             return []
@@ -149,6 +154,82 @@ class WorkflowEnv(gym.Env):
                 self.staged_gcs_input_paths[input_key] = None # Mark as failed
                 raise # Re-raise to stop episode if staging fails critically
 
+    def _poll_pending_tasks(self):
+        """Check for any Ray tasks that have completed without blocking."""
+        if not self.pending_tasks:
+            return None
+
+        ready_refs, _ = ray.wait([t[0] for t in self.pending_tasks], num_returns=1, timeout=0)
+        if not ready_refs:
+            return None
+
+        ready_ref = ready_refs[0]
+        idx = next(i for i, t in enumerate(self.pending_tasks) if t[0] == ready_ref)
+        finished_task_def = self.pending_tasks.pop(idx)
+        task_result = ray.get(ready_ref)
+
+        current_task_def = finished_task_def[1]
+        cpu_allocation = finished_task_def[2]
+        ram_allocation_gb = finished_task_def[3]
+        task_id = finished_task_def[4]
+
+        if self.metrics_logger_actor:
+            ray.get(self.metrics_logger_actor.log_task_metrics.remote(task_result))
+
+        if task_result and task_result.get('success'):
+            task_type_hist_key = task_result['task_type']
+            if task_type_hist_key not in self.historical_performance:
+                self.historical_performance[task_type_hist_key] = {'durations': [], 'costs': [], 'cpu_utils': [], 'ram_utils': []}
+
+            self.historical_performance[task_type_hist_key]['durations'].append(task_result['duration_seconds'])
+            self.historical_performance[task_type_hist_key]['costs'].append(task_result['cost'])
+            self.historical_performance[task_type_hist_key]['cpu_utils'].append(task_result['cpu_utilization'])
+
+            allocated_ram_gb = task_result.get('ram_allocated_gb', 1)
+            actual_ram_gb = task_result.get('ram_utilization_gb', 0)
+            ram_util_ratio = actual_ram_gb / allocated_ram_gb if allocated_ram_gb > 0 else 0.0
+            self.historical_performance[task_type_hist_key]['ram_utils'].append(ram_util_ratio)
+
+            history_limit = self.config.get('rl_config', {}).get('historical_performance_window', 10)
+            for key in self.historical_performance[task_type_hist_key]:
+                self.historical_performance[task_type_hist_key][key] = self.historical_performance[task_type_hist_key][key][-history_limit:]
+
+        self.last_task_result = task_result
+        self.last_task_output_path = None
+        if task_result['success'] and current_task_def.get('produces_primary_output', False):
+            primary_key = current_task_def.get('primary_output_key')
+            task_outputs = task_result.get('output_files', {})
+            if primary_key and primary_key in task_outputs:
+                self.last_task_output_path = task_outputs[primary_key]
+                logger.info(f"Primary output from '{current_task_def['type']}' (ID: {task_id}) using key '{primary_key}': {self.last_task_output_path}")
+            elif primary_key:
+                logger.warning(f"Task {task_id} ('{current_task_def['type']}') was marked 'produces_primary_output' with key '{primary_key}', but key not found in task_result['output_files'] ({list(task_outputs.keys())}). No primary output set.")
+                self.last_task_output_path = None
+            else:
+                logger.warning(f"Task {task_id} ('{current_task_def['type']}') is marked 'produces_primary_output' but 'primary_output_key' is missing in its definition in config.yaml. Cannot determine primary output. No primary output set.")
+                self.last_task_output_path = None
+
+        reward = self._calculate_reward(task_result)
+        done = (self.current_task_idx >= len(self.workflow_definition) and not self.pending_tasks) or not task_result['success']
+
+        next_observation = self._calculate_observation(
+            task_result=task_result,
+            current_task_def=self.workflow_definition[self.current_task_idx] if not done else None,
+            attempt_num=0,
+            run_id=self.run_id,
+        )
+
+        info = {
+            "task_id": task_id,
+            "task_type": current_task_def['type'],
+            "cpu_allocation": cpu_allocation,
+            "ram_allocation": ram_allocation_gb,
+            "result": task_result,
+            "run_id": self.run_id,
+        }
+
+        return next_observation, reward, done, info
+
     def reset(self, *, seed=None, options=None): # Added seed and options
         """
         Resets the environment for a new episode.
@@ -158,6 +239,7 @@ class WorkflowEnv(gym.Env):
         self.current_task_idx = 0
         self.last_task_output_path = None # Reset output from previous episode
         self.staged_gcs_input_paths = {} # Reset staged paths
+        self.pending_tasks = []  # Clear any pending tasks from a previous run
 
         # Initialize metrics logger actor once per environment, if not already done
         if self.metrics_logger_actor is None:
@@ -200,9 +282,14 @@ class WorkflowEnv(gym.Env):
             return np.zeros(self.observation_space.shape, dtype=np.float32), 0.0, True, {"message": "Episode already completed."}
 
 
+        # First poll for any previously launched tasks that may have finished
+        completed = self._poll_pending_tasks()
+        if completed:
+            return completed
+
         current_task_def = self.workflow_definition[self.current_task_idx]
         task_type = current_task_def['type']
-        task_id = f"{current_task_def['task_id_prefix']}-{self.run_id}-{self.current_task_idx}" # Unique ID for this task
+        task_id = f"{current_task_def['task_id_prefix']}-{self.run_id}-{self.current_task_idx}"  # Unique ID for this task
         attempt_num = 0 # Currently, retries are not handled in env, always attempt 0
 
         cpu_allocation = self.action_tiers[action]['cpu']
@@ -246,7 +333,6 @@ class WorkflowEnv(gym.Env):
         task_output_gcs_dir = current_task_def['output_prefix']
 
         # --- Launch the task asynchronously on Ray ---
-        task_result = {} # Initialize task_result in case of pre-execution error
         try:
             task_ref = run_computational_task.remote(
                 task_id,
@@ -255,85 +341,40 @@ class WorkflowEnv(gym.Env):
                 task_output_gcs_dir,
                 cpu_allocation,
                 ram_allocation_gb,
-                self.config # Pass the full pipeline config to run_task
+                self.config
             )
-            task_result = ray.get(task_ref) # Wait for the task to complete
-            logger.info(f"Task {task_id} completed. Success: {task_result['success']}")
+            self.pending_tasks.append((task_ref, current_task_def, cpu_allocation, ram_allocation_gb, task_id))
+            self.current_task_idx += 1
         except Exception as e:
-            logger.exception(f"Error running task {task_id} via Ray:")
-            # Create a failed task result to allow reward calculation and episode continuation/termination
-            task_result = {
-                "task_id": task_id, "task_type": task_type, "duration_seconds": -1,
-                "cost": self.normalization_constants['max_cost'], # Penalize with max cost
-                "cpu_utilization": 0, "ram_utilization_gb": 0,
-                "cpu_allocated": cpu_allocation, "ram_allocated_gb": ram_allocation_gb,
-                "exit_status": 1, "success": False, "output_files": {}
+            logger.exception(f"Error launching task {task_id} via Ray:")
+            failed_result = {
+                "task_id": task_id,
+                "task_type": task_type,
+                "duration_seconds": -1,
+                "cost": self.normalization_constants['max_cost'],
+                "cpu_utilization": 0,
+                "ram_utilization_gb": 0,
+                "cpu_allocated": cpu_allocation,
+                "ram_allocated_gb": ram_allocation_gb,
+                "exit_status": 1,
+                "success": False,
+                "output_files": {}
             }
+            return self._calculate_observation(failed_result, None, attempt_num, self.run_id), self._calculate_reward(failed_result), True, {"error": str(e)}
 
-        # Log task metrics to GCS using the MetricsLogger Actor
-        if self.metrics_logger_actor:
-            ray.get(self.metrics_logger_actor.log_task_metrics.remote(task_result)) # Log asynchronously
+        # Immediately check if any task (including the one just launched) has finished
+        completed = self._poll_pending_tasks()
+        if completed:
+            return completed
 
-        # --- Update Historical Performance ---
-        if task_result and task_result.get('success'): # Only log successful tasks for historical averages
-            task_type_hist_key = task_result['task_type'] # Use the actual task_type string as key
-            if task_type_hist_key not in self.historical_performance:
-                self.historical_performance[task_type_hist_key] = {'durations': [], 'costs': [], 'cpu_utils': [], 'ram_utils': []}
+        # If additional tasks remain and we are under the concurrency limit, return the next task's observation
+        if len(self.pending_tasks) < self.max_concurrent_tasks and self.current_task_idx < len(self.workflow_definition):
+            obs = self._calculate_observation({}, self.workflow_definition[self.current_task_idx], attempt_num, self.run_id)
+            return obs, 0.0, False, {"message": "Task launched"}
 
-            self.historical_performance[task_type_hist_key]['durations'].append(task_result['duration_seconds'])
-            self.historical_performance[task_type_hist_key]['costs'].append(task_result['cost'])
-            self.historical_performance[task_type_hist_key]['cpu_utils'].append(task_result['cpu_utilization']) # This should be 0-1 ratio
-
-            allocated_ram_gb = task_result.get('ram_allocated_gb', 1)
-            actual_ram_gb = task_result.get('ram_utilization_gb', 0)
-            ram_util_ratio = actual_ram_gb / allocated_ram_gb if allocated_ram_gb > 0 else 0.0
-            self.historical_performance[task_type_hist_key]['ram_utils'].append(ram_util_ratio)
-
-            history_limit = self.config.get('rl_config', {}).get('historical_performance_window', 10)
-            for key in self.historical_performance[task_type_hist_key]:
-                self.historical_performance[task_type_hist_key][key] = self.historical_performance[task_type_hist_key][key][-history_limit:]
-
-        # --- Update Environment State for Next Step ---
-        self.last_task_result = task_result
-        self.last_task_output_path = None # Reset for the next task
-        if task_result['success'] and current_task_def.get('produces_primary_output', False):
-            primary_key = current_task_def.get('primary_output_key')
-            task_outputs = task_result.get('output_files', {})
-            if primary_key and primary_key in task_outputs:
-                self.last_task_output_path = task_outputs[primary_key]
-                logger.info(f"Primary output from '{task_type}' (ID: {task_id}) using key '{primary_key}': {self.last_task_output_path}")
-            elif primary_key: # Key was specified but not found in outputs
-                logger.warning(f"Task {task_id} ('{task_type}') was marked 'produces_primary_output' with key '{primary_key}', but key not found in task_result['output_files'] ({list(task_outputs.keys())}). No primary output set.")
-                self.last_task_output_path = None # Explicitly set to None
-            else: # produces_primary_output was true, but no key specified in config
-                logger.warning(f"Task {task_id} ('{task_type}') is marked 'produces_primary_output' but 'primary_output_key' is missing in its definition in config.yaml. Cannot determine primary output. No primary output set.")
-                self.last_task_output_path = None # Explicitly set to None
-
-        # --- Calculate Reward ---
-        reward = self._calculate_reward(task_result)
-
-        # --- Determine Episode Progression ---
-        self.current_task_idx += 1
-        # Episode is done if all tasks are completed OR if the current task failed critically
-        done = self.current_task_idx >= len(self.workflow_definition) or not task_result['success']
-
-        next_observation = self._calculate_observation(
-            task_result=task_result,
-            current_task_def=self.workflow_definition[self.current_task_idx] if not done else None, # Pass None if episode is done
-            attempt_num=attempt_num,
-            run_id=self.run_id
-        )
-
-        info = {
-            "task_id": task_id,
-            "task_type": task_type,
-            "cpu_allocation": cpu_allocation,
-            "ram_allocation": ram_allocation,
-            "result": task_result,
-            "run_id": self.run_id # Include run_id in info for debugging
-        }
-
-        return next_observation, reward, done, info
+        # Otherwise no task finished yet, so just wait
+        obs = self._calculate_observation({}, None, attempt_num, self.run_id)
+        return obs, 0.0, False, {"message": "Waiting for task completion"}
 
     def _calculate_reward(self, task_result: dict) -> float:
         """
@@ -370,7 +411,10 @@ class WorkflowEnv(gym.Env):
 
         total_reward = r_success + r_cost + r_time + r_util
 
-        logger.info(f"Reward components for task {task_id} - Success: {r_success:.2f}, Cost: {r_cost:.2f}, Time: {r_time:.2f}, Util: {r_util:.2f} -> Total Reward: {total_reward:.2f}")
+        log_task_id = task_result.get('task_id', 'unknown')
+        logger.info(
+            f"Reward components for task {log_task_id} - Success: {r_success:.2f}, Cost: {r_cost:.2f}, Time: {r_time:.2f}, Util: {r_util:.2f} -> Total Reward: {total_reward:.2f}"
+        )
 
         return float(total_reward)
 
