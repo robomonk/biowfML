@@ -17,7 +17,6 @@ gcs_paths:
 # --- Input Sources (Public GCS paths or other accessible locations) ---
 # These define the *source* of the data that will be copied to your staging_bucket.
 input_sources:
-  # Public RNA-Seq Gallus Gallus data
   rnaseq_chicken_ref: "gs://rnaseq-nf/data/ggal/transcript.fa"
   rnaseq_chicken_read1: "gs://rnaseq-nf/data/ggal/gut_1.fq"
   rnaseq_chicken_read2: "gs://rnaseq-nf/data/ggal/gut_2.fq"
