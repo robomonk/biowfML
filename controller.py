@@ -72,7 +72,10 @@ if __name__ == "__main__":
         current_script_dir = os.path.dirname(os.path.abspath(__file__))
         # Set working_dir for workers to the directory containing the scripts.
         # This helps ensure that workflow_env.py and utils.py are importable.
-        runtime_env = {"working_dir": current_script_dir}
+        runtime_env = {
+            "working_dir": current_script_dir,
+            "pip": ["torch --index-url https://download.pytorch.org/whl/cpu"]
+        }
 
         ray.init(address=args.ray_address, ignore_reinit_error=True, runtime_env=runtime_env)
         # logger.info(f"Ray initialized with address: {ray.get_head_address()}") # Commented out, problematic with Ray Client
